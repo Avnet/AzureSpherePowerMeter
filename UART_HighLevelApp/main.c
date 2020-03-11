@@ -69,6 +69,9 @@ static int uartFd = -1;
 static int gpioButtonFd = -1;
 static int pwrMeterEnFd = -1;
 
+// Declare a variable to drive output format
+bool outputCSV = false;
+
 EventLoop *eventLoop = NULL;
 EventRegistration *uartEventReg = NULL;
 EventLoopTimer *buttonPollTimer = NULL;
@@ -170,14 +173,21 @@ static void ButtonTimerEventHandler(EventLoopTimer *timer)
         return;
     }
 
-    // If the button has just been pressed, send data over the UART
+    // If the button has just been pressed, toggle the output boolean
     // The button has GPIO_Value_Low when pressed and GPIO_Value_High when released
     if (newButtonState != buttonState) {
         if (newButtonState == GPIO_Value_Low) {
-           
-            // Call the routine that sends commands to the power monitor device to request power data.
-            transmit_MCP39F511_commands();
+
+            //  Toggle the output boolean
+            outputCSV = outputCSV ? false : true;
+
+            if (outputCSV) {
+                // Print the CSV header
+                Log_Debug("voltage, current\n");
+
+            }
         }
+        
         buttonState = newButtonState;
     }
 }
@@ -221,7 +231,14 @@ void ParseMCP39F511Response(uint8_t* msg)
     // Parse out the measurements from the mesage
     float fVoltage = (float)((uint16_t)(msg[voltage_rms + 1] << 8) | ((uint16_t)(msg[voltage_rms]))) / (float)100.0f;
     float fCurrent = (float)((uint32_t)(msg[current_rms + 3] << 24) | (uint32_t)(msg[current_rms + 2] << 16) | (uint32_t)(msg[current_rms + 1] << 8) | (uint32_t)(msg[current_rms])) / (float)1000.0f;
-    Log_Debug("voltage %.3f V, current %.3f mA \n", fVoltage, fCurrent);
+    
+    if (outputCSV) {
+
+        Log_Debug("%.3f, %.3f\n", fVoltage, fCurrent);
+    }
+    else {
+        Log_Debug("voltage %.3f V, current %.3f mA \n", fVoltage, fCurrent);
+    }
 }
 
 /// <summary>
