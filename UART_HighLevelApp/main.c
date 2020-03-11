@@ -60,7 +60,8 @@ typedef enum {
     ExitCode_Init_OpenButton = 9,
     ExitCode_Init_ButtonPollTimer = 10,
     ExitCode_Main_EventLoopFail = 11,
-    ExitCode_Init_OpenGPIO35 = 12
+    ExitCode_Init_OpenGPIO35 = 12,
+    ExitCode_Init_MCP39F511PollTimer = 13
 } ExitCode;
 
 // File descriptors - initialized to invalid value
@@ -71,6 +72,7 @@ static int pwrMeterEnFd = -1;
 EventLoop *eventLoop = NULL;
 EventRegistration *uartEventReg = NULL;
 EventLoopTimer *buttonPollTimer = NULL;
+EventLoopTimer *MCP39F511PollTimer = NULL;
 
 // State variables
 static GPIO_Value_Type buttonState = GPIO_Value_High;
@@ -79,8 +81,9 @@ static GPIO_Value_Type buttonState = GPIO_Value_High;
 static volatile sig_atomic_t exitCode = ExitCode_Success;
 
 static void TerminationHandler(int signalNumber);
-static void SendUartMessage(int uartFd, const char *dataToSend, int bytesToSend);
+static void SendUartMessage(int uartFd, const char *dataToSend, size_t bytesToSend);
 static void ButtonTimerEventHandler(EventLoopTimer *timer);
+static void MCP39F511PollTimerEventHandler(EventLoopTimer* timer);
 static void UartEventHandler(EventLoop *el, int fd, EventLoop_IoEvents events, void *context);
 static ExitCode InitPeripheralsAndHandlers(void);
 static void CloseFdAndPrintError(int fd, const char *fdName);
@@ -125,7 +128,7 @@ void transmit_MCP39F511_commands(void) {
 /// <param name="uartFd">The open file descriptor of the UART to write to</param>
 /// <param name="dataToSend">The data to send over the UART</param>
 /// <parm name= "bytesToSend"> The number of bytes to send over the UART</parm>
-static void SendUartMessage(int uartFd, const char *dataToSend, int bytesToSend)
+static void SendUartMessage(int uartFd, const char *dataToSend, size_t bytesToSend)
 {
     size_t totalBytesSent = 0;
     size_t totalBytesToSend = bytesToSend;
@@ -179,6 +182,22 @@ static void ButtonTimerEventHandler(EventLoopTimer *timer)
     }
 }
 
+/// <summary>
+///     Handle timer event: Read the Power Monitor device.
+/// </summary>
+
+static void MCP39F511PollTimerEventHandler(EventLoopTimer* timer)
+{
+    if (ConsumeEventLoopTimerEvent(timer) != 0) {
+        exitCode = ExitCode_ButtonTimer_Consume;
+        return;
+    }
+
+    // Call the routine that sends commands to the power monitor device to request power data.
+    transmit_MCP39F511_commands();
+}
+
+
 ///<summary>
 ///		Parses received MCU data to extract data values and reports to IoT Hub as needed.
 ///</summary>
@@ -221,7 +240,7 @@ static void UartEventHandler(EventLoop* el, int fd, EventLoop_IoEvents events, v
 #define RECEIVE_BUFFER_SIZE		128
 
     // Define the structure of the MCP39F511 response
-    typedef enum {
+    enum Msg_Fmt {
         HEADER = 0,
         MESSAGE_SIZE,
         COMMAND_BYTE,
@@ -231,7 +250,7 @@ static void UartEventHandler(EventLoop* el, int fd, EventLoop_IoEvents events, v
         DATABYTE4,
         DATABYTE5,
         DATABYTE6
-    } Msg_Fmt;
+    };
 
     //static receive buffer for UART
     static char receiveBuffer[RECEIVE_BUFFER_SIZE];
@@ -240,7 +259,6 @@ static void UartEventHandler(EventLoop* el, int fd, EventLoop_IoEvents events, v
     static size_t nBytesInBuffer = 0;
 
     uint8_t* pchSegment = &receiveBuffer[nBytesInBuffer];
-    uint8_t checkSum = 0;
     uint8_t* msgPointer = &receiveBuffer[0];
 
     // Poll the UART and store the byte(s) behind already received bytes
@@ -307,7 +325,7 @@ static void UartEventHandler(EventLoop* el, int fd, EventLoop_IoEvents events, v
 
                 // First verify that the data is correct, use the message checkSum
                 // Reset the checkSum variable
-                checkSum = 0;
+                uint8_t checkSum = 0;
 
                 // Calculate the checksum.
                 for (int i = 0; i <= msgPointer[MESSAGE_SIZE] - 1; i++) {
@@ -375,7 +393,8 @@ static ExitCode InitPeripheralsAndHandlers(void)
         return ExitCode_Init_EventLoop;
     }
 
-    // Create a UART_Config object, open the UART and set up UART event handler
+    // Create a UART_Config object: open the UART, set up UART event handler and configure
+    // a timer to poll the power monitor device
     UART_Config uartConfig;
     UART_InitConfig(&uartConfig);
     uartConfig.baudRate = 9600;
@@ -390,14 +409,23 @@ static ExitCode InitPeripheralsAndHandlers(void)
         return ExitCode_Init_RegisterIo;
     }
 
+    // Set the poll time for 250ms
+    struct timespec MCP39F511PollPeriod = { .tv_sec = 0, .tv_nsec = 250 * 1000 * 1000 };
+    MCP39F511PollTimer = CreateEventLoopPeriodicTimer(eventLoop,  MCP39F511PollTimerEventHandler,
+        &MCP39F511PollPeriod);
+    if (MCP39F511PollTimer == NULL) {
+        return ExitCode_Init_MCP39F511PollTimer;
+    }
+
     // Open Power Meter Enable GPIO as output
     Log_Debug("Opening GPIO 35 as output.\n");
+    // Drive the GPIO Low to enable the Click Board in Click site #2
     pwrMeterEnFd = GPIO_OpenAsOutput(AVNET_MT3620_SK_GPIO35, GPIO_OutputMode_PushPull, GPIO_Value_Low);
     if (pwrMeterEnFd < 0) {
         Log_Debug("ERROR: Could not open GPIO 35: %s (%d).\n", strerror(errno), errno);
         return ExitCode_Init_OpenGPIO35;
     }
-    
+
     // Open button GPIO as input, and set up a timer to poll it
     Log_Debug("Opening BUTTON_A as input.\n");
     gpioButtonFd = GPIO_OpenAsInput(AVNET_MT3620_SK_USER_BUTTON_A);
@@ -436,6 +464,7 @@ static void CloseFdAndPrintError(int fd, const char *fdName)
 static void ClosePeripheralsAndHandlers(void)
 {
     DisposeEventLoopTimer(buttonPollTimer);
+    DisposeEventLoopTimer(MCP39F511PollTimer);
     EventLoop_UnregisterIo(eventLoop, uartEventReg);
     EventLoop_Close(eventLoop);
 
