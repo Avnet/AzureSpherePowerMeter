@@ -59,12 +59,14 @@ typedef enum {
     ExitCode_Init_RegisterIo = 8,
     ExitCode_Init_OpenButton = 9,
     ExitCode_Init_ButtonPollTimer = 10,
-    ExitCode_Main_EventLoopFail = 11
+    ExitCode_Main_EventLoopFail = 11,
+    ExitCode_Init_OpenGPIO35 = 12
 } ExitCode;
 
 // File descriptors - initialized to invalid value
 static int uartFd = -1;
 static int gpioButtonFd = -1;
+static int pwrMeterEnFd = -1;
 
 EventLoop *eventLoop = NULL;
 EventRegistration *uartEventReg = NULL;
@@ -77,7 +79,7 @@ static GPIO_Value_Type buttonState = GPIO_Value_High;
 static volatile sig_atomic_t exitCode = ExitCode_Success;
 
 static void TerminationHandler(int signalNumber);
-static void SendUartMessage(int uartFd, const char *dataToSend);
+static void SendUartMessage(int uartFd, const char *dataToSend, int bytesToSend);
 static void ButtonTimerEventHandler(EventLoopTimer *timer);
 static void UartEventHandler(EventLoop *el, int fd, EventLoop_IoEvents events, void *context);
 static ExitCode InitPeripheralsAndHandlers(void);
@@ -94,14 +96,39 @@ static void TerminationHandler(int signalNumber)
 }
 
 /// <summary>
+///     Helper function to send a fixed message to the UART
+/// </summary>
+void transmit_MCP39F511_commands(void) {
+
+    // Define the message to send.  We are requesting a register read starting at address 0x0006 and reading 0x0C bytes
+    const uint8_t messageToSend[] = { 0xA5, 0x08, 0x41, 0x0, 0x06, 0x4E, 0x0C, 0x4E };
+
+    // We're only going to send one byte at a time to the MCP3f9F511 device, so declare an array of size 1
+    uint8_t messagePart[1];
+
+    // Setup ts to ~0.03 seconds
+    struct timespec ts;
+    ts.tv_sec = 0;
+    ts.tv_nsec = 33333333;
+
+    // The MCP39F511 does not correctly receive our message unless we send one byte at a time and insert a delay between bytes.
+    for (int i = 0; i < 8; i++) {
+        messagePart[0] = messageToSend[i];
+        SendUartMessage(uartFd, messagePart, 1);
+        nanosleep(&ts, NULL);
+    }
+}
+
+/// <summary>
 ///     Helper function to send a fixed message via the given UART.
 /// </summary>
 /// <param name="uartFd">The open file descriptor of the UART to write to</param>
 /// <param name="dataToSend">The data to send over the UART</param>
-static void SendUartMessage(int uartFd, const char *dataToSend)
+/// <parm name= "bytesToSend"> The number of bytes to send over the UART</parm>
+static void SendUartMessage(int uartFd, const char *dataToSend, int bytesToSend)
 {
     size_t totalBytesSent = 0;
-    size_t totalBytesToSend = strlen(dataToSend);
+    size_t totalBytesToSend = bytesToSend;
     int sendIterations = 0;
     while (totalBytesSent < totalBytesToSend) {
         sendIterations++;
@@ -118,8 +145,7 @@ static void SendUartMessage(int uartFd, const char *dataToSend)
 
         totalBytesSent += (size_t)bytesSent;
     }
-
-    Log_Debug("Sent %zu bytes over UART in %d calls.\n", totalBytesSent, sendIterations);
+//    Log_Debug("Sent %zu bytes over UART in %d calls.\n", totalBytesSent, sendIterations);
 }
 
 /// <summary>
@@ -145,35 +171,189 @@ static void ButtonTimerEventHandler(EventLoopTimer *timer)
     // The button has GPIO_Value_Low when pressed and GPIO_Value_High when released
     if (newButtonState != buttonState) {
         if (newButtonState == GPIO_Value_Low) {
-            SendUartMessage(uartFd, "Hello world!\n");
+           
+            // Call the routine that sends commands to the power monitor device to request power data.
+            transmit_MCP39F511_commands();
         }
         buttonState = newButtonState;
     }
 }
 
+///<summary>
+///		Parses received MCU data to extract data values and reports to IoT Hub as needed.
+///</summary>
+///<param name=",msg">A pointer to the receive data.</param>
+///<param name="nLineLength">Length of received MCU data.</param>
+//void MCU_ParseDataToIotHub(char *pszLine, size_t nLineLength)
+void ParseMCP39F511Response(uint8_t* msg)
+{
+
+    // Define indexes into the response message.
+    enum response_msg {
+        response_id = 0,
+        message_size = 1,
+        voltage_rms = 2,
+        line_frequency = 4,
+        input_voltage = 6,
+        power_factor = 8,
+        current_rms = 10,
+    };
+
+    // Parse out the measurements from the mesage
+    float fVoltage = (float)((uint16_t)(msg[voltage_rms + 1] << 8) | ((uint16_t)(msg[voltage_rms]))) / (float)100.0f;
+    float fCurrent = (float)((uint32_t)(msg[current_rms + 3] << 24) | (uint32_t)(msg[current_rms + 2] << 16) | (uint32_t)(msg[current_rms + 1] << 8) | (uint32_t)(msg[current_rms])) / (float)1000.0f;
+    Log_Debug("voltage %.3f V, current %.3f mA \n", fVoltage, fCurrent);
+}
+
 /// <summary>
-///     Handle UART event: if there is incoming data, print it.
+///     Handle UART event: if there is incoming data, check to see if it's a complete message.
 ///     This satisfies the EventLoopIoCallback signature.
 /// </summary>
-static void UartEventHandler(EventLoop *el, int fd, EventLoop_IoEvents events, void *context)
+static void UartEventHandler(EventLoop* el, int fd, EventLoop_IoEvents events, void* context)
 {
-    const size_t receiveBufferSize = 256;
-    uint8_t receiveBuffer[receiveBufferSize + 1]; // allow extra byte for string termination
-    ssize_t bytesRead;
+    
+    // MCP39F511 Response codes
+#define MCP_ACK 0x06
+#define MCP_NACK 0x15
+#define MCP_CSFAIL 0x51
 
-    // Read incoming UART data. It is expected behavior that messages may be received in multiple
-    // partial chunks.
-    bytesRead = read(uartFd, receiveBuffer, receiveBufferSize);
-    if (bytesRead < 0) {
-        Log_Debug("ERROR: Could not read UART: %s (%d).\n", strerror(errno), errno);
-        exitCode = ExitCode_UartEvent_Read;
+// UART ring buffer size
+#define RECEIVE_BUFFER_SIZE		128
+
+    // Define the structure of the MCP39F511 response
+    typedef enum {
+        HEADER = 0,
+        MESSAGE_SIZE,
+        COMMAND_BYTE,
+        DATABYTE1,
+        DATABYTE2,
+        DATABYTE3,
+        DATABYTE4,
+        DATABYTE5,
+        DATABYTE6
+    } Msg_Fmt;
+
+    //static receive buffer for UART
+    static char receiveBuffer[RECEIVE_BUFFER_SIZE];
+
+    //Number of bytes in ring buffer
+    static size_t nBytesInBuffer = 0;
+
+    uint8_t* pchSegment = &receiveBuffer[nBytesInBuffer];
+    uint8_t checkSum = 0;
+    uint8_t* msgPointer = &receiveBuffer[0];
+
+    // Poll the UART and store the byte(s) behind already received bytes
+    ssize_t nBytesRead = read(fd, (void*)pchSegment, RECEIVE_BUFFER_SIZE - nBytesInBuffer);
+    nBytesInBuffer += (size_t)nBytesRead;
+
+    /*
+        Log_Debug("nBytesRead = %d\n", nBytesRead);
+
+        for (int i = 0; i < nBytesRead; i++) {
+            Log_Debug("%x ", msgPointer[i]);
+        }
+        Log_Debug("\n");
+    */
+
+    if (nBytesRead < 0) {
+        Log_Debug("ERROR: Problem reading from UART: %s (%d).\n", strerror(errno), errno);
         return;
     }
 
-    if (bytesRead > 0) {
-        // Null terminate the buffer to make it a valid string, and print it
-        receiveBuffer[bytesRead] = 0;
-        Log_Debug("UART received %d bytes: '%s'.\n", bytesRead, (char *)receiveBuffer);
+    if (nBytesRead == 0) {
+        return;
+    }
+
+    if (nBytesInBuffer >= RECEIVE_BUFFER_SIZE) // buffer overrun, discard content
+    {
+        Log_Debug("ERROR: UART reveiver buffer too small or EOL missing, discarding content!\n");
+        nBytesInBuffer = 0;
+        return;
+    }
+
+    // while we have data in the buffer that can be processed loop and process messages
+
+    // We need to track when we have data, but not the complete message.
+    bool messageIsComplete = true;
+
+    do {
+
+        // We have data.  Either process the data or bail if we don't have at least one complete message.
+
+        // Switch on the message header byte
+        switch (msgPointer[HEADER]) {
+
+        case MCP_CSFAIL:
+            Log_Debug("Message RX: MCP_CSFAIL\n");
+            // consume the response byte
+            msgPointer++;
+            nBytesInBuffer--;
+            break;
+
+        case MCP_NACK:
+            Log_Debug("Message RX: MCP_NACK\n");
+            // consume the response byte
+            msgPointer++;
+            nBytesInBuffer--;
+            break;
+
+        case MCP_ACK: // We have a message to process!
+
+            // Check to see if we have the entire message
+            if (nBytesInBuffer >= msgPointer[MESSAGE_SIZE]) {
+
+                //Log_Debug("Message RX: MCP_ACK\n");
+
+                // First verify that the data is correct, use the message checkSum
+                // Reset the checkSum variable
+                checkSum = 0;
+
+                // Calculate the checksum.
+                for (int i = 0; i <= msgPointer[MESSAGE_SIZE] - 1; i++) {
+                    // We process all the bytes except the checksum value 
+                    if (i < msgPointer[MESSAGE_SIZE] - 1) {
+                        checkSum += msgPointer[i];
+                    }
+                }
+
+                // Validate the message is not corrupt by comparing the calculated checkSum with
+                // the provided checkSum in the message.  If it's bad just output a message and move on.
+                // This data will be discarded.
+
+                if (msgPointer[msgPointer[MESSAGE_SIZE] - 1] != checkSum) {
+                    Log_Debug("WARNING: CheckSums DON'T match, expected %x  Discarding message!\n", checkSum);
+                }
+                else {
+
+                    ParseMCP39F511Response(msgPointer);
+
+                }
+
+                // Adjust the Byte counter, subtract the message size we just processed
+                nBytesInBuffer -= msgPointer[MESSAGE_SIZE];
+            }
+            else {
+                // We don't have the entire message, set the flag so we fall out of the do/while loop.
+                // When the additional data comes in over the UART we'll append it to the data we currently
+                // have.
+                messageIsComplete = false;
+            }
+            break;
+
+        default:
+            Log_Debug("WARNING: Unknown Header!\n");
+            // consume the response byte
+            msgPointer++;
+            nBytesInBuffer--;
+            break;
+        }
+
+    } while ((nBytesInBuffer > 0) && messageIsComplete);
+
+    // If we have any data that we did not process, move the remaining bytes to begining of the receive buffer
+    if (nBytesInBuffer > 0) {
+        memcpy((void*)receiveBuffer, (const void*)msgPointer, nBytesInBuffer);
     }
 }
 
@@ -198,7 +378,7 @@ static ExitCode InitPeripheralsAndHandlers(void)
     // Create a UART_Config object, open the UART and set up UART event handler
     UART_Config uartConfig;
     UART_InitConfig(&uartConfig);
-    uartConfig.baudRate = 115200;
+    uartConfig.baudRate = 9600;
     uartConfig.flowControl = UART_FlowControl_None;
     uartFd = UART_Open(SAMPLE_UART, &uartConfig);
     if (uartFd < 0) {
@@ -210,9 +390,17 @@ static ExitCode InitPeripheralsAndHandlers(void)
         return ExitCode_Init_RegisterIo;
     }
 
+    // Open Power Meter Enable GPIO as output
+    Log_Debug("Opening GPIO 35 as output.\n");
+    pwrMeterEnFd = GPIO_OpenAsOutput(AVNET_MT3620_SK_GPIO35, GPIO_OutputMode_PushPull, GPIO_Value_Low);
+    if (pwrMeterEnFd < 0) {
+        Log_Debug("ERROR: Could not open GPIO 35: %s (%d).\n", strerror(errno), errno);
+        return ExitCode_Init_OpenGPIO35;
+    }
+    
     // Open button GPIO as input, and set up a timer to poll it
-    Log_Debug("Opening SAMPLE_BUTTON_1 as input.\n");
-    gpioButtonFd = GPIO_OpenAsInput(SAMPLE_BUTTON_1);
+    Log_Debug("Opening BUTTON_A as input.\n");
+    gpioButtonFd = GPIO_OpenAsInput(AVNET_MT3620_SK_USER_BUTTON_A);
     if (gpioButtonFd < 0) {
         Log_Debug("ERROR: Could not open button GPIO: %s (%d).\n", strerror(errno), errno);
         return ExitCode_Init_OpenButton;
@@ -253,6 +441,7 @@ static void ClosePeripheralsAndHandlers(void)
 
     Log_Debug("Closing file descriptors.\n");
     CloseFdAndPrintError(gpioButtonFd, "GpioButton");
+    CloseFdAndPrintError(pwrMeterEnFd, "GPIO35");
     CloseFdAndPrintError(uartFd, "Uart");
 }
 
@@ -263,7 +452,7 @@ int main(int argc, char *argv[])
 {
     Log_Debug("UART application starting.\n");
     exitCode = InitPeripheralsAndHandlers();
-
+  
     // Use event loop to wait for events and trigger handlers, until an error or SIGTERM happens
     while (exitCode == ExitCode_Success) {
         EventLoop_Run_Result result = EventLoop_Run(eventLoop, -1, true);

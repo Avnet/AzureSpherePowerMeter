@@ -5,8 +5,8 @@
   "EntryPoint": "/bin/app",
   "CmdArgs": [],
   "Capabilities": {
-    "Gpio": [ "$SAMPLE_BUTTON_1" ],
-    "Uart": [ "$SAMPLE_UART" ]
+    "Gpio": [ "$AVNET_MT3620_SK_USER_BUTTON_A", "$AVNET_MT3620_SK_GPIO35" ],
+    "Uart": [ "$AVNET_MT3620_SK_ISU0_UART" ]
   },
   "ApplicationType": "Default"
 }
