@@ -228,9 +228,14 @@ void ParseMCP39F511Response(uint8_t* msg)
         current_rms = 10,
     };
 
+#define VOLTAGE_DIVISOR 100.0F   // Use with PWR METER click board
+#define CURRENT_DIVISOR 1000.0F  // Use with PWR METER click board
+//#define VOLTAGE_DIVISOR 10.0F   // Use with adm00667 Microchip MCP39F511 development kit  
+//#define CURRENT_DIVISOR 10000.0F  // Use with adm00667 Microchip MCP39F511 development kit
+
     // Parse out the measurements from the mesage
-    float fVoltage = (float)((uint16_t)(msg[voltage_rms + 1] << 8) | ((uint16_t)(msg[voltage_rms]))) / (float)100.0f;
-    float fCurrent = (float)((uint32_t)(msg[current_rms + 3] << 24) | (uint32_t)(msg[current_rms + 2] << 16) | (uint32_t)(msg[current_rms + 1] << 8) | (uint32_t)(msg[current_rms])) / (float)1000.0f;
+    float fVoltage = (float)((uint16_t)(msg[voltage_rms + 1] << 8) | ((uint16_t)(msg[voltage_rms]))) / (float)VOLTAGE_DIVISOR;
+    float fCurrent = (float)((uint32_t)(msg[current_rms + 3] << 24) | (uint32_t)(msg[current_rms + 2] << 16) | (uint32_t)(msg[current_rms + 1] << 8) | (uint32_t)(msg[current_rms])) / (float)CURRENT_DIVISOR;
     
     if (outputCSV) {
 
@@ -414,7 +419,8 @@ static ExitCode InitPeripheralsAndHandlers(void)
     // a timer to poll the power monitor device
     UART_Config uartConfig;
     UART_InitConfig(&uartConfig);
-    uartConfig.baudRate = 9600;
+    uartConfig.baudRate = 9600;   // Use if your device has the MCP39F511A device
+//  uartConfig.baudRate = 115200; // Use if your device has the MCP39F511 device
     uartConfig.flowControl = UART_FlowControl_None;
     uartFd = UART_Open(SAMPLE_UART, &uartConfig);
     if (uartFd < 0) {
