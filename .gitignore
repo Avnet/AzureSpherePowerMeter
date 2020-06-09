@@ -1,0 +1,13 @@
+﻿################################################################################
+# This .gitignore file was automatically created by Microsoft(R) Visual Studio.
+################################################################################
+
+/.vs/AzureSpherePowerMeter
+/.vs/slnx.sqlite
+/.vs
+/UART_HighLevelApp/.vs/UART_HighLevelApp/config/applicationhost.config
+/UART_HighLevelApp/.vs/UART_HighLevelApp/v16/ipch/AutoPCH
+/UART_HighLevelApp/.vs/UART_HighLevelApp/v16/.suo
+/UART_HighLevelApp/.vs/VSWorkspaceState.json
+/UART_HighLevelApp/.vs/cmake.db
+/UART_HighLevelApp/.vs/CMake Overview
